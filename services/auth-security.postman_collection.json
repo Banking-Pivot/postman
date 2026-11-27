@@ -1,0 +1,1601 @@
+{
+  "info": {
+    "name": "auth-service - inicio de sesión, roles y tokens",
+    "description": "Seguridad de la plataforma vista desde fuera: inicio de sesión, peticiones sin token, lo que puede hacer un ADMIN y lo que no puede hacer un USER, usuarios deshabilitados, bloqueo por contraseñas incorrectas, tokens de servicio y la clave pública (JWKS). Todo va por el API Gateway (perfil dev, puerto 8080), que necesita discovery-server, auth-service y product-service arriba; ajusta baseUrl si corre en otra dirección. La colección inicia sesión sola con username y password (el primer administrador; su contraseña de desarrollo está en Vault) y manda el token en todas las peticiones, salvo en las que prueban justamente que falta. Corre la colección completa y en orden: cada carpeta usa lo que crean las anteriores. Cada corrida crea tres usuarios nuevos y los deja deshabilitados: usuario.NNNNNN, bloqueo.NNNNNN y clave.NNNNNN, con el que se prueba la contraseña incorrecta. Ninguna petición falla el inicio de sesión del administrador: cinco contraseñas incorrectas seguidas bloquean a un usuario durante 15 minutos, y también a él.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{accessToken}}",
+        "type": "string"
+      }
+    ]
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "const expiresAt = Number(pm.collectionVariables.get('accessTokenExpiresAt') || 0);",
+          "if (!pm.collectionVariables.get('accessToken') || Date.now() > expiresAt) {",
+          "  pm.sendRequest({",
+          "    url: pm.collectionVariables.get('baseUrl') + '/api/v1/auth/login',",
+          "    method: 'POST',",
+          "    header: { 'Content-Type': 'application/json' },",
+          "    body: { mode: 'raw', raw: JSON.stringify({",
+          "      username: pm.collectionVariables.get('username'),",
+          "      password: pm.collectionVariables.get('password') }) }",
+          "  }, (error, response) => {",
+          "    if (error || response.code !== 200) { throw new Error('No se pudo iniciar sesión'); }",
+          "    const body = response.json();",
+          "    pm.collectionVariables.set('accessToken', body.accessToken);",
+          "    pm.collectionVariables.set('accessTokenExpiresAt', Date.now() + (body.expiresIn - 60) * 1000);",
+          "  });",
+          "}"
+        ]
+      }
+    }
+  ],
+  "item": [
+    {
+      "name": "1. Inicio de sesión (auth-service)",
+      "description": "POST /api/v1/auth/login es público: no lleva token. Devuelve el token de acceso (JWT firmado con RS256), cuánto dura en segundos y los roles del usuario. Usuario desconocido, contraseña incorrecta, usuario deshabilitado y usuario bloqueado reciben la misma respuesta.",
+      "item": [
+        {
+          "name": "01 Iniciar sesión como administrador",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const part = (token, index) => JSON.parse(atob(",
+                  "  token.split('.')[index].replace(/-/g, '+').replace(/_/g, '/')));",
+                  "const body = pm.response.json();",
+                  "pm.test('200 OK con token Bearer y el rol ADMIN', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(body.tokenType).to.eql('Bearer');",
+                  "  pm.expect(body.expiresIn).to.be.above(0);",
+                  "  pm.expect(body.roles).to.include('ADMIN');",
+                  "  pm.expect(body.accessToken.split('.')).to.have.lengthOf(3);",
+                  "});",
+                  "pm.test('La respuesta no se guarda en caché', () =>",
+                  "  pm.expect(pm.response.headers.get('Cache-Control')).to.include('no-store'));",
+                  "pm.test('El token está firmado con RS256 y nombra su clave (kid)', () => {",
+                  "  const header = part(body.accessToken, 0);",
+                  "  pm.expect(header.alg).to.eql('RS256');",
+                  "  pm.expect(header.kid).to.be.a('string').and.not.empty;",
+                  "});",
+                  "pm.test('El token lleva emisor, usuario, roles, vencimiento e identificador', () => {",
+                  "  const claims = part(body.accessToken, 1);",
+                  "  pm.expect(claims.iss).to.eql('banking-auth');",
+                  "  pm.expect(claims.sub).to.eql(pm.collectionVariables.get('username'));",
+                  "  pm.expect(claims.roles).to.eql(body.roles);",
+                  "  pm.expect(claims.exp - claims.iat).to.eql(body.expiresIn);",
+                  "  pm.expect(claims.jti).to.be.a('string').and.not.empty;",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/auth/login",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"{{username}}\",\n  \"password\": \"{{password}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "02 Contraseña incorrecta (401)",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// La contraseña incorrecta se prueba con un usuario creado para eso y nunca con el",
+                  "// administrador: las contraseñas incorrectas seguidas bloquean al usuario, y la colección",
+                  "// inicia sesión como administrador.",
+                  "const name = 'clave.' + Math.floor(100000 + Math.random() * 900000);",
+                  "pm.collectionVariables.set('wrongPasswordUsername', name);",
+                  "pm.sendRequest({",
+                  "  url: pm.collectionVariables.get('baseUrl') + '/api/v1/auth/users',",
+                  "  method: 'POST',",
+                  "  header: {",
+                  "    'Content-Type': 'application/json',",
+                  "    'Authorization': 'Bearer ' + pm.collectionVariables.get('accessToken')",
+                  "  },",
+                  "  body: { mode: 'raw', raw: JSON.stringify({",
+                  "    username: name,",
+                  "    password: pm.collectionVariables.get('newPassword'),",
+                  "    roles: ['USER'] }) }",
+                  "}, (error, response) => {",
+                  "  if (error || response.code !== 201) { throw new Error('No se pudo crear el usuario'); }",
+                  "  pm.collectionVariables.set('wrongPasswordUserId', response.json().id);",
+                  "});"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('401 Unauthorized con código INVALID_CREDENTIALS', () => {",
+                  "  pm.response.to.have.status(401);",
+                  "  pm.expect(pm.response.json().code).to.eql('INVALID_CREDENTIALS');",
+                  "});",
+                  "pm.test('El mensaje no dice si falló el usuario o la contraseña', () =>",
+                  "  pm.expect(pm.response.json().message)",
+                  "    .to.eql('The username or the password is not correct.'));",
+                  "// El usuario de esta prueba queda deshabilitado.",
+                  "pm.sendRequest({",
+                  "  url: pm.collectionVariables.get('baseUrl') + '/api/v1/auth/users/'",
+                  "    + pm.collectionVariables.get('wrongPasswordUserId') + '/disable',",
+                  "  method: 'POST',",
+                  "  header: { 'Authorization': 'Bearer ' + pm.collectionVariables.get('accessToken') }",
+                  "}, (error, response) => {",
+                  "  pm.test('El usuario de la prueba queda deshabilitado', () =>",
+                  "    pm.expect(response.code).to.eql(200));",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/auth/login",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"{{wrongPasswordUsername}}\",\n  \"password\": \"no-es-la-clave\"\n}"
+            }
+          }
+        },
+        {
+          "name": "03 Usuario que no existe (401, la misma respuesta)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('401 Unauthorized con código INVALID_CREDENTIALS', () => {",
+                  "  pm.response.to.have.status(401);",
+                  "  pm.expect(pm.response.json().code).to.eql('INVALID_CREDENTIALS');",
+                  "});",
+                  "pm.test('El mensaje no dice si falló el usuario o la contraseña', () =>",
+                  "  pm.expect(pm.response.json().message)",
+                  "    .to.eql('The username or the password is not correct.'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/auth/login",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"nadie.con.este.nombre\",\n  \"password\": \"no-es-la-clave\"\n}"
+            }
+          }
+        },
+        {
+          "name": "04 Pedido sin contraseña (400)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400 Bad Request con código INVALID_REQUEST', () => {",
+                  "  pm.response.to.have.status(400);",
+                  "  pm.expect(pm.response.json().code).to.eql('INVALID_REQUEST');",
+                  "});",
+                  "pm.test('El mensaje nombra el campo que falta', () =>",
+                  "  pm.expect(pm.response.json().message).to.include('password'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/auth/login",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"{{username}}\"\n}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. Peticiones sin token (api-gateway)",
+      "description": "Todo lo que está bajo /api/v1/ pide un token, salvo el inicio de sesión, el token de servicio y la clave pública. El API Gateway responde 401 antes de llamar al servicio.",
+      "item": [
+        {
+          "name": "05 Listar usuarios sin token (401)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('401 Unauthorized con código UNAUTHORIZED', () => {",
+                  "  pm.response.to.have.status(401);",
+                  "  pm.expect(pm.response.json().code).to.eql('UNAUTHORIZED');",
+                  "});",
+                  "pm.test('La respuesta pide un token Bearer', () =>",
+                  "  pm.expect(pm.response.headers.get('WWW-Authenticate')).to.match(/^Bearer/));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/auth/users",
+            "auth": {
+              "type": "noauth"
+            }
+          }
+        },
+        {
+          "name": "06 Listar productos sin token (401)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('401 Unauthorized con código UNAUTHORIZED', () => {",
+                  "  pm.response.to.have.status(401);",
+                  "  pm.expect(pm.response.json().code).to.eql('UNAUTHORIZED');",
+                  "});",
+                  "pm.test('La respuesta pide un token Bearer', () =>",
+                  "  pm.expect(pm.response.headers.get('WWW-Authenticate')).to.match(/^Bearer/));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/products",
+            "auth": {
+              "type": "noauth"
+            }
+          }
+        },
+        {
+          "name": "07 Token con la firma alterada (401)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('401 Unauthorized con código UNAUTHORIZED', () => {",
+                  "  pm.response.to.have.status(401);",
+                  "  pm.expect(pm.response.json().code).to.eql('UNAUTHORIZED');",
+                  "});",
+                  "pm.test('La respuesta pide un token Bearer', () =>",
+                  "  pm.expect(pm.response.headers.get('WWW-Authenticate')).to.match(/^Bearer/));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/products",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{accessToken}}alterado",
+                  "type": "string"
+                }
+              ]
+            },
+            "description": "El token del administrador con texto añadido a la firma: la firma ya no corresponde a la clave pública."
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. Roles ADMIN y USER",
+      "description": "El administrador crea un usuario con el rol USER. Ese usuario inicia sesión y puede consultar, pero no administrar usuarios ni cambiar el catálogo de productos: eso es solo para ADMIN. Cada corrida crea un usuario con nombre nuevo.",
+      "item": [
+        {
+          "name": "08 El administrador crea un usuario con rol USER",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Nombre nuevo en cada corrida: auth-service no admite nombres repetidos.",
+                  "pm.collectionVariables.set('newUsername',",
+                  "  'usuario.' + Math.floor(100000 + Math.random() * 900000));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('201 Created con Location', () => {",
+                  "  pm.response.to.have.status(201);",
+                  "  pm.expect(pm.response.headers.get('Location')).to.include(body.id);",
+                  "});",
+                  "pm.test('Usuario activo con el rol USER', () => {",
+                  "  pm.expect(body.username).to.eql(pm.collectionVariables.get('newUsername'));",
+                  "  pm.expect(body.roles).to.eql(['USER']);",
+                  "  pm.expect(body.status).to.eql('ACTIVE');",
+                  "});",
+                  "pm.test('La contraseña no vuelve en la respuesta', () => {",
+                  "  pm.expect(body).to.not.have.property('password');",
+                  "  pm.expect(pm.response.text())",
+                  "    .to.not.include(pm.collectionVariables.get('newPassword'));",
+                  "});",
+                  "pm.collectionVariables.set('userId', body.id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/auth/users",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"{{newUsername}}\",\n  \"password\": \"{{newPassword}}\",\n  \"roles\": [\"USER\"]\n}"
+            }
+          }
+        },
+        {
+          "name": "09 El mismo nombre otra vez, en mayúsculas (409)",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Mayúsculas y minúsculas nombran al mismo usuario.",
+                  "pm.collectionVariables.set('newUsername',",
+                  "  pm.collectionVariables.get('newUsername').toUpperCase());"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('409 Conflict con código USERNAME_ALREADY_EXISTS', () => {",
+                  "  pm.response.to.have.status(409);",
+                  "  pm.expect(pm.response.json().code).to.eql('USERNAME_ALREADY_EXISTS');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/auth/users",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"{{newUsername}}\",\n  \"password\": \"{{newPassword}}\",\n  \"roles\": [\"USER\"]\n}"
+            }
+          }
+        },
+        {
+          "name": "10 Ese usuario inicia sesión",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set('newUsername',",
+                  "  pm.collectionVariables.get('newUsername').toLowerCase());"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const part = (token, index) => JSON.parse(atob(",
+                  "  token.split('.')[index].replace(/-/g, '+').replace(/_/g, '/')));",
+                  "const body = pm.response.json();",
+                  "pm.test('200 OK con el rol USER y nada más', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(body.roles).to.eql(['USER']);",
+                  "  pm.expect(part(body.accessToken, 1).roles).to.eql(['USER']);",
+                  "});",
+                  "pm.collectionVariables.set('userToken', body.accessToken);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/auth/login",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"{{newUsername}}\",\n  \"password\": \"{{newPassword}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "11 Ese usuario no puede crear usuarios (403)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('403 Forbidden con código FORBIDDEN', () => {",
+                  "  pm.response.to.have.status(403);",
+                  "  pm.expect(pm.response.json().code).to.eql('FORBIDDEN');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/auth/users",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{userToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"otro.{{newUsername}}\",\n  \"password\": \"{{newPassword}}\",\n  \"roles\": [\"ADMIN\"]\n}"
+            }
+          }
+        },
+        {
+          "name": "12 Ese usuario no puede listar usuarios (403)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('403 Forbidden con código FORBIDDEN', () => {",
+                  "  pm.response.to.have.status(403);",
+                  "  pm.expect(pm.response.json().code).to.eql('FORBIDDEN');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/auth/users",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{userToken}}",
+                  "type": "string"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "13 Ese usuario no puede crear productos (403)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('403 Forbidden con código FORBIDDEN', () => {",
+                  "  pm.response.to.have.status(403);",
+                  "  pm.expect(pm.response.json().code).to.eql('FORBIDDEN');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/products",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{userToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"code\": \"PM_SEGURIDAD\",\n  \"name\": \"Ahorro de prueba de seguridad\",\n  \"family\": \"SAVINGS\",\n  \"eligibility\": {\n    \"customerTypes\": [\n      \"PERSONAL\"\n    ],\n    \"requiresCreditCard\": false\n  },\n  \"terms\": {\n    \"openingMinimum\": {\n      \"PEN\": 0,\n      \"USD\": 0\n    },\n    \"freeMonthlyMovements\": 5,\n    \"movementFee\": {\n      \"PEN\": 2.5,\n      \"USD\": 0.75\n    },\n    \"monthlyMovementLimit\": 10\n  }\n}"
+            },
+            "description": "El pedido es válido: lo rechaza el rol, no el contenido. El producto no se crea."
+          }
+        },
+        {
+          "name": "14 Ese usuario sí puede consultar productos",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/products",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{userToken}}",
+                  "type": "string"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "15 El administrador sí puede listar usuarios",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('200 OK con el administrador en la lista', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(body.items.map(user => user.username))",
+                  "    .to.include(pm.collectionVariables.get('username'));",
+                  "});",
+                  "pm.test('Ningún usuario trae su contraseña', () => body.items.forEach(user => {",
+                  "  pm.expect(user).to.not.have.property('password');",
+                  "  pm.expect(user).to.not.have.property('passwordHash');",
+                  "}));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/auth/users?page=0&size=100"
+          }
+        },
+        {
+          "name": "16 El administrador sí pasa el control de acceso de productos",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('No es 401 ni 403: el pedido llegó a product-service', () =>",
+                  "  pm.expect(pm.response.code).to.not.be.oneOf([401, 403]));",
+                  "pm.test('400 Bad Request: product-service rechaza el pedido vacío', () => {",
+                  "  pm.response.to.have.status(400);",
+                  "  pm.expect(pm.response.json().code).to.eql('INVALID_REQUEST');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/products",
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            },
+            "description": "El mismo camino que el usuario tenía prohibido, con el token del administrador. El pedido va vacío a propósito: así se ve que el API Gateway lo deja pasar sin crear un producto de más en el catálogo."
+          }
+        },
+        {
+          "name": "17 El administrador consulta al usuario creado",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK con el usuario activo', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(pm.response.json().id).to.eql(pm.collectionVariables.get('userId'));",
+                  "  pm.expect(pm.response.json().status).to.eql('ACTIVE');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/auth/users/{{userId}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "4. Deshabilitar un usuario",
+      "description": "Un usuario deshabilitado no puede iniciar sesión y recibe la misma respuesta que una contraseña incorrecta. El token que ya tenía sigue valiendo hasta que vence (una hora): un JWT no se puede revocar antes. La carpeta deja al usuario de la corrida deshabilitado.",
+      "item": [
+        {
+          "name": "18 Deshabilitar al usuario",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK con el usuario deshabilitado', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(pm.response.json().status).to.eql('DISABLED');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/auth/users/{{userId}}/disable"
+          }
+        },
+        {
+          "name": "19 El usuario deshabilitado no puede iniciar sesión (401)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('401 Unauthorized con código INVALID_CREDENTIALS', () => {",
+                  "  pm.response.to.have.status(401);",
+                  "  pm.expect(pm.response.json().code).to.eql('INVALID_CREDENTIALS');",
+                  "});",
+                  "pm.test('El mensaje no dice si falló el usuario o la contraseña', () =>",
+                  "  pm.expect(pm.response.json().message)",
+                  "    .to.eql('The username or the password is not correct.'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/auth/login",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"{{newUsername}}\",\n  \"password\": \"{{newPassword}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "20 Habilitarlo de nuevo",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK con el usuario activo', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(pm.response.json().status).to.eql('ACTIVE');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/auth/users/{{userId}}/enable"
+          }
+        },
+        {
+          "name": "21 Vuelve a iniciar sesión",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/auth/login",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"{{newUsername}}\",\n  \"password\": \"{{newPassword}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "22 Usuario que no existe (404)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('404 Not Found con código USER_NOT_FOUND', () => {",
+                  "  pm.response.to.have.status(404);",
+                  "  pm.expect(pm.response.json().code).to.eql('USER_NOT_FOUND');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/auth/users/00000000-0000-4000-8000-000000000000/disable"
+          }
+        },
+        {
+          "name": "23 Deshabilitar al usuario al terminar",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK con el usuario deshabilitado', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(pm.response.json().status).to.eql('DISABLED');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/auth/users/{{userId}}/disable"
+          }
+        }
+      ]
+    },
+    {
+      "name": "5. Tokens de servicio",
+      "description": "POST /api/v1/auth/service-token es público y lo usan account-service y credit-service para llamar a otros servicios con el rol SERVICE. Los secretos de los clientes están en Vault y no van en esta colección: para probar el caso correcto, escribe el secreto de account-service en la variable serviceClientSecret sin guardarla.",
+      "item": [
+        {
+          "name": "24 Token de servicio con secreto incorrecto (401)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('401 Unauthorized con código INVALID_CLIENT', () => {",
+                  "  pm.response.to.have.status(401);",
+                  "  pm.expect(pm.response.json().code).to.eql('INVALID_CLIENT');",
+                  "});",
+                  "pm.test('El mensaje no dice si falló el cliente o el secreto', () =>",
+                  "  pm.expect(pm.response.json().message)",
+                  "    .to.eql('The client ID or the client secret is not correct.'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/auth/service-token",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"clientId\": \"account-service\",\n  \"clientSecret\": \"no-es-el-secreto\"\n}"
+            }
+          }
+        },
+        {
+          "name": "25 Cliente que no existe (401, la misma respuesta)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('401 Unauthorized con código INVALID_CLIENT', () => {",
+                  "  pm.response.to.have.status(401);",
+                  "  pm.expect(pm.response.json().code).to.eql('INVALID_CLIENT');",
+                  "});",
+                  "pm.test('El mensaje no dice si falló el cliente o el secreto', () =>",
+                  "  pm.expect(pm.response.json().message)",
+                  "    .to.eql('The client ID or the client secret is not correct.'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/auth/service-token",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"clientId\": \"servicio-desconocido\",\n  \"clientSecret\": \"no-es-el-secreto\"\n}"
+            }
+          }
+        },
+        {
+          "name": "26 Un usuario no obtiene un token de servicio con su contraseña (401)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('401 Unauthorized con código INVALID_CLIENT', () => {",
+                  "  pm.response.to.have.status(401);",
+                  "  pm.expect(pm.response.json().code).to.eql('INVALID_CLIENT');",
+                  "});",
+                  "pm.test('El mensaje no dice si falló el cliente o el secreto', () =>",
+                  "  pm.expect(pm.response.json().message)",
+                  "    .to.eql('The client ID or the client secret is not correct.'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/auth/service-token",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"clientId\": \"{{username}}\",\n  \"clientSecret\": \"{{password}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "27 Token de servicio con su secreto (se salta si serviceClientSecret está vacía)",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (!pm.collectionVariables.get('serviceClientSecret')) {",
+                  "  pm.execution.skipRequest();",
+                  "}"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const part = (token, index) => JSON.parse(atob(",
+                  "  token.split('.')[index].replace(/-/g, '+').replace(/_/g, '/')));",
+                  "const body = pm.response.json();",
+                  "pm.test('200 OK con el rol SERVICE', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(body.tokenType).to.eql('Bearer');",
+                  "  pm.expect(body.roles).to.eql(['SERVICE']);",
+                  "  pm.expect(part(body.accessToken, 1).sub).to.eql('account-service');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/auth/service-token",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"clientId\": \"account-service\",\n  \"clientSecret\": \"{{serviceClientSecret}}\"\n}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "6. Clave pública (JWKS)",
+      "description": "GET /api/v1/auth/jwks es público: publica la clave con la que el API Gateway comprueba la firma de los tokens. Solo la parte pública.",
+      "item": [
+        {
+          "name": "28 Clave pública sin token",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const part = (token, index) => JSON.parse(atob(",
+                  "  token.split('.')[index].replace(/-/g, '+').replace(/_/g, '/')));",
+                  "const keys = pm.response.json().keys;",
+                  "pm.test('200 OK con al menos una clave RSA para firmar con RS256', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(keys).to.be.an('array').that.is.not.empty;",
+                  "  keys.forEach(key => {",
+                  "    pm.expect(key.kty).to.eql('RSA');",
+                  "    pm.expect(key.use).to.eql('sig');",
+                  "    pm.expect(key.alg).to.eql('RS256');",
+                  "    pm.expect(key.n).to.be.a('string').and.not.empty;",
+                  "    pm.expect(key.e).to.be.a('string').and.not.empty;",
+                  "  });",
+                  "});",
+                  "pm.test('Nada de la clave privada', () => keys.forEach(key =>",
+                  "  ['d', 'p', 'q', 'dp', 'dq', 'qi'].forEach(name =>",
+                  "    pm.expect(key).to.not.have.property(name))));",
+                  "pm.test('El token del administrador nombra una de las claves publicadas', () => {",
+                  "  const kid = part(pm.collectionVariables.get('accessToken'), 0).kid;",
+                  "  pm.expect(keys.map(key => key.kid)).to.include(kid);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/auth/jwks",
+            "auth": {
+              "type": "noauth"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "7. Bloqueo por contraseñas incorrectas",
+      "description": "Cinco contraseñas incorrectas seguidas (auth.login.max-failed-attempts) bloquean al usuario durante 15 minutos (auth.login.lock-duration). Mientras dura el bloqueo, el inicio de sesión responde el mismo 401 INVALID_CREDENTIALS también con la contraseña correcta: la respuesta no dice que el usuario existe ni que está bloqueado. Un inicio de sesión correcto antes del límite reinicia la cuenta. El administrador ve la cuenta (failedAttempts) y hasta cuándo dura el bloqueo (lockedUntil) en el usuario, y lo termina antes con POST /api/v1/auth/users/{userId}/unlock; habilitar al usuario también lo desbloquea. La carpeta usa un usuario propio (bloqueo.NNNNNN) y lo deja deshabilitado: nunca falla el inicio de sesión del administrador, porque la colección inicia sesión con él y la regla también lo bloquearía.",
+      "item": [
+        {
+          "name": "29 El administrador crea un usuario para bloquearlo",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Usuario propio de esta carpeta: nunca se falla el inicio de sesión del administrador,",
+                  "// porque la colección entera inicia sesión con él.",
+                  "pm.collectionVariables.set('lockUsername',",
+                  "  'bloqueo.' + Math.floor(100000 + Math.random() * 900000));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "pm.test('Empieza sin intentos fallidos y sin bloqueo', () => {",
+                  "  pm.expect(body.failedAttempts).to.eql(0);",
+                  "  pm.expect(body).to.not.have.property('lockedUntil');",
+                  "});",
+                  "pm.collectionVariables.set('lockUserId', body.id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/auth/users",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"{{lockUsername}}\",\n  \"password\": \"{{newPassword}}\",\n  \"roles\": [\"USER\"]\n}"
+            }
+          }
+        },
+        {
+          "name": "30 Contraseña incorrecta, intento 1 de 5 (401)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('401 Unauthorized con código INVALID_CREDENTIALS', () => {",
+                  "  pm.response.to.have.status(401);",
+                  "  pm.expect(pm.response.json().code).to.eql('INVALID_CREDENTIALS');",
+                  "});",
+                  "pm.test('El mensaje no dice si falló el usuario o la contraseña', () =>",
+                  "  pm.expect(pm.response.json().message)",
+                  "    .to.eql('The username or the password is not correct.'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/auth/login",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"{{lockUsername}}\",\n  \"password\": \"no-es-la-clave\"\n}"
+            }
+          }
+        },
+        {
+          "name": "31 Contraseña incorrecta, intento 2 de 5 (401)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('401 Unauthorized con código INVALID_CREDENTIALS', () => {",
+                  "  pm.response.to.have.status(401);",
+                  "  pm.expect(pm.response.json().code).to.eql('INVALID_CREDENTIALS');",
+                  "});",
+                  "pm.test('El mensaje no dice si falló el usuario o la contraseña', () =>",
+                  "  pm.expect(pm.response.json().message)",
+                  "    .to.eql('The username or the password is not correct.'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/auth/login",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"{{lockUsername}}\",\n  \"password\": \"no-es-la-clave\"\n}"
+            }
+          }
+        },
+        {
+          "name": "32 Contraseña incorrecta, intento 3 de 5 (401)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('401 Unauthorized con código INVALID_CREDENTIALS', () => {",
+                  "  pm.response.to.have.status(401);",
+                  "  pm.expect(pm.response.json().code).to.eql('INVALID_CREDENTIALS');",
+                  "});",
+                  "pm.test('El mensaje no dice si falló el usuario o la contraseña', () =>",
+                  "  pm.expect(pm.response.json().message)",
+                  "    .to.eql('The username or the password is not correct.'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/auth/login",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"{{lockUsername}}\",\n  \"password\": \"no-es-la-clave\"\n}"
+            }
+          }
+        },
+        {
+          "name": "33 Contraseña incorrecta, intento 4 de 5 (401)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('401 Unauthorized con código INVALID_CREDENTIALS', () => {",
+                  "  pm.response.to.have.status(401);",
+                  "  pm.expect(pm.response.json().code).to.eql('INVALID_CREDENTIALS');",
+                  "});",
+                  "pm.test('El mensaje no dice si falló el usuario o la contraseña', () =>",
+                  "  pm.expect(pm.response.json().message)",
+                  "    .to.eql('The username or the password is not correct.'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/auth/login",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"{{lockUsername}}\",\n  \"password\": \"no-es-la-clave\"\n}"
+            }
+          }
+        },
+        {
+          "name": "34 Contraseña incorrecta, intento 5 de 5 (401)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('401 Unauthorized con código INVALID_CREDENTIALS', () => {",
+                  "  pm.response.to.have.status(401);",
+                  "  pm.expect(pm.response.json().code).to.eql('INVALID_CREDENTIALS');",
+                  "});",
+                  "pm.test('El mensaje no dice si falló el usuario o la contraseña', () =>",
+                  "  pm.expect(pm.response.json().message)",
+                  "    .to.eql('The username or the password is not correct.'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/auth/login",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"{{lockUsername}}\",\n  \"password\": \"no-es-la-clave\"\n}"
+            }
+          }
+        },
+        {
+          "name": "35 Bloqueado: la contraseña correcta también se rechaza (401)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('401 Unauthorized con código INVALID_CREDENTIALS', () => {",
+                  "  pm.response.to.have.status(401);",
+                  "  pm.expect(pm.response.json().code).to.eql('INVALID_CREDENTIALS');",
+                  "});",
+                  "pm.test('El mensaje no dice si falló el usuario o la contraseña', () =>",
+                  "  pm.expect(pm.response.json().message)",
+                  "    .to.eql('The username or the password is not correct.'));",
+                  "pm.test('La respuesta no dice que el usuario está bloqueado', () => {",
+                  "  pm.expect(pm.response.text().toLowerCase()).to.not.include('lock');",
+                  "  pm.expect(pm.response.json()).to.not.have.property('lockedUntil');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/auth/login",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"{{lockUsername}}\",\n  \"password\": \"{{newPassword}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "36 El administrador ve el bloqueo del usuario",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('200 OK con 5 intentos fallidos', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(body.failedAttempts).to.eql(5);",
+                  "});",
+                  "pm.test('lockedUntil es un instante futuro, a no más de 15 minutos', () => {",
+                  "  const remaining = new Date(body.lockedUntil).getTime() - Date.now();",
+                  "  pm.expect(remaining).to.be.above(0);",
+                  "  pm.expect(remaining).to.be.at.most(15 * 60 * 1000 + 5000);",
+                  "});",
+                  "pm.test('Sigue activo: el bloqueo no cambia el estado', () =>",
+                  "  pm.expect(body.status).to.eql('ACTIVE'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/auth/users/{{lockUserId}}"
+          }
+        },
+        {
+          "name": "37 El administrador desbloquea al usuario",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('200 OK sin intentos fallidos y sin bloqueo', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(body.id).to.eql(pm.collectionVariables.get('lockUserId'));",
+                  "  pm.expect(body.failedAttempts).to.eql(0);",
+                  "  pm.expect(body).to.not.have.property('lockedUntil');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/auth/users/{{lockUserId}}/unlock"
+          }
+        },
+        {
+          "name": "38 Desbloquearlo otra vez no cambia nada",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('200 OK sin intentos fallidos y sin bloqueo', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(body.id).to.eql(pm.collectionVariables.get('lockUserId'));",
+                  "  pm.expect(body.failedAttempts).to.eql(0);",
+                  "  pm.expect(body).to.not.have.property('lockedUntil');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/auth/users/{{lockUserId}}/unlock"
+          }
+        },
+        {
+          "name": "39 El usuario desbloqueado inicia sesión",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK con el token del usuario', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(pm.response.json().accessToken).to.be.a('string').and.not.empty;",
+                  "  pm.expect(pm.response.json().roles).to.eql(['USER']);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/auth/login",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"{{lockUsername}}\",\n  \"password\": \"{{newPassword}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "40 Desbloquear a un usuario que no existe (404)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('404 Not Found con código USER_NOT_FOUND', () => {",
+                  "  pm.response.to.have.status(404);",
+                  "  pm.expect(pm.response.json().code).to.eql('USER_NOT_FOUND');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/auth/users/00000000-0000-4000-8000-000000000000/unlock"
+          }
+        },
+        {
+          "name": "41 Deshabilitar al usuario al terminar",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK con el usuario deshabilitado', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(pm.response.json().status).to.eql('DISABLED');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/auth/users/{{lockUserId}}/disable"
+          }
+        }
+      ]
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8080"
+    },
+    {
+      "key": "username",
+      "value": "admin"
+    },
+    {
+      "key": "password",
+      "value": "Admin-dev-2026"
+    },
+    {
+      "key": "accessToken",
+      "value": ""
+    },
+    {
+      "key": "accessTokenExpiresAt",
+      "value": "0"
+    },
+    {
+      "key": "newUsername",
+      "value": ""
+    },
+    {
+      "key": "newPassword",
+      "value": "Clave-de-prueba-2026"
+    },
+    {
+      "key": "userId",
+      "value": ""
+    },
+    {
+      "key": "userToken",
+      "value": ""
+    },
+    {
+      "key": "wrongPasswordUsername",
+      "value": ""
+    },
+    {
+      "key": "wrongPasswordUserId",
+      "value": ""
+    },
+    {
+      "key": "lockUsername",
+      "value": ""
+    },
+    {
+      "key": "lockUserId",
+      "value": ""
+    },
+    {
+      "key": "serviceClientSecret",
+      "value": ""
+    }
+  ]
+}

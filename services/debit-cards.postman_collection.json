@@ -1,0 +1,1811 @@
+{
+  "info": {
+    "name": "card-service - tarjeta de débito",
+    "description": "Tarjeta de débito asociada a las cuentas bancarias de un cliente: emisión con número enmascarado, verificación de la cuenta con account-service por Kafka, segunda cuenta asociada, pago con cargo a la cuenta principal, pago que pasa a la siguiente cuenta cuando la principal no tiene saldo, pago rechazado, reporte de los últimos diez movimientos, cambio de cuenta principal, bloqueo, tarjeta rechazada por pedirla sobre la cuenta de otro cliente y límite de tres tarjetas por cliente (las rechazadas no cuentan). card-service guarda la tarjeta y sus cuentas; los pagos y el reporte de movimientos son de transaction-service. Todo va por el API Gateway (perfil dev, puerto 8080), que necesita Kafka, discovery-server, auth-service, customer-service, product-service, account-service, card-service y transaction-service arriba; ajusta baseUrl si corre en otra dirección. La colección inicia sesión sola con username y password. Corre la colección completa y en orden: cada carpeta usa el cliente, las cuentas y la tarjeta de las anteriores. Cada corrida crea clientes, cuentas, tarjetas y operationId nuevos, así que se puede repetir sobre la misma base.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{accessToken}}",
+        "type": "string"
+      }
+    ]
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "const expiresAt = Number(pm.collectionVariables.get('accessTokenExpiresAt') || 0);",
+          "if (!pm.collectionVariables.get('accessToken') || Date.now() > expiresAt) {",
+          "  pm.sendRequest({",
+          "    url: pm.collectionVariables.get('baseUrl') + '/api/v1/auth/login',",
+          "    method: 'POST',",
+          "    header: { 'Content-Type': 'application/json' },",
+          "    body: { mode: 'raw', raw: JSON.stringify({",
+          "      username: pm.collectionVariables.get('username'),",
+          "      password: pm.collectionVariables.get('password') }) }",
+          "  }, (error, response) => {",
+          "    if (error || response.code !== 200) { throw new Error('No se pudo iniciar sesión'); }",
+          "    const body = response.json();",
+          "    pm.collectionVariables.set('accessToken', body.accessToken);",
+          "    pm.collectionVariables.set('accessTokenExpiresAt', Date.now() + (body.expiresIn - 60) * 1000);",
+          "  });",
+          "}"
+        ]
+      }
+    }
+  ],
+  "item": [
+    {
+      "name": "1. Cliente y dos cuentas con saldos distintos (customer-service, account-service)",
+      "item": [
+        {
+          "name": "01 Crear cliente PERSONAL STANDARD",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Documento nuevo en cada corrida: customer-service no admite documentos repetidos.",
+                  "pm.collectionVariables.set('document', String(Math.floor(10000000 + Math.random() * 90000000)));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "pm.test('Cliente PERSONAL STANDARD ACTIVE', () => {",
+                  "  pm.expect(body.type).to.eql('PERSONAL');",
+                  "  pm.expect(body.profile).to.eql('STANDARD');",
+                  "  pm.expect(body.status).to.eql('ACTIVE');",
+                  "});",
+                  "pm.collectionVariables.set('customerId', body.id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/customers",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"type\": \"PERSONAL\",\n  \"profile\": \"STANDARD\",\n  \"documentType\": \"DNI\",\n  \"documentNumber\": \"{{document}}\",\n  \"name\": \"Ana Perez\"\n}"
+            }
+          }
+        },
+        {
+          "name": "02 Abrir cuenta de ahorro PEN con 300",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "pm.test('SAVINGS PEN ACTIVE con saldo 300', () => {",
+                  "  pm.expect(body.product).to.eql('SAVINGS');",
+                  "  pm.expect(body.currency).to.eql('PEN');",
+                  "  pm.expect(body.status).to.eql('ACTIVE');",
+                  "  pm.expect(body.balance).to.eql(300);",
+                  "});",
+                  "pm.collectionVariables.set('savingsId', body.id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/accounts",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"product\": \"SAVINGS\",\n  \"currency\": \"PEN\",\n  \"primaryHolderId\": \"{{customerId}}\",\n  \"initialDeposit\": 300\n}"
+            }
+          }
+        },
+        {
+          "name": "03 Abrir cuenta corriente PEN sin depósito",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "pm.test('CHECKING PEN ACTIVE con saldo 0', () => {",
+                  "  pm.expect(body.product).to.eql('CHECKING');",
+                  "  pm.expect(body.currency).to.eql('PEN');",
+                  "  pm.expect(body.status).to.eql('ACTIVE');",
+                  "  pm.expect(body.balance).to.eql(0);",
+                  "});",
+                  "pm.collectionVariables.set('checkingId', body.id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/accounts",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"product\": \"CHECKING\",\n  \"currency\": \"PEN\",\n  \"primaryHolderId\": \"{{customerId}}\",\n  \"initialDeposit\": 0\n}"
+            }
+          }
+        },
+        {
+          "name": "04 Depositar 1000 en la cuenta corriente",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set('operationId', pm.variables.replaceIn('{{$guid}}'));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "pm.test('DEPOSIT sin comisión, saldo 1000', () => {",
+                  "  pm.expect(body.type).to.eql('DEPOSIT');",
+                  "  pm.expect(body.status).to.eql('COMPLETED');",
+                  "  pm.expect(body.fee).to.eql(0);",
+                  "  pm.expect(body.balanceAfter).to.eql(1000);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/accounts/{{checkingId}}/deposits",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"operationId\": \"{{operationId}}\",\n  \"amount\": 1000\n}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. Tarjeta de débito sobre la cuenta de ahorro",
+      "item": [
+        {
+          "name": "05 Pedir la tarjeta con la cuenta de ahorro como principal",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.unset('pollCount');"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('202 Accepted: la tarjeta espera la verificación de su cuenta', () => {",
+                  "  pm.response.to.have.status(202);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.status).to.eql('PENDING_VERIFICATION');",
+                  "  pm.expect(body.customerId).to.eql(pm.collectionVariables.get('customerId'));",
+                  "  pm.expect(body.mainAccountId).to.eql(pm.collectionVariables.get('savingsId'));",
+                  "  pm.expect(pm.response.headers.get('Location')).to.eql('/api/v1/cards/' + body.id);",
+                  "});",
+                  "pm.test('El número de 16 dígitos se muestra enmascarado', () => {",
+                  "  pm.expect(pm.response.json().maskedNumber).to.match(/^\\*{4} \\*{4} \\*{4} \\d{4}$/);",
+                  "});",
+                  "pm.test('La cuenta principal queda PENDING en la posición 1', () => {",
+                  "  const accounts = pm.response.json().accounts;",
+                  "  pm.expect(accounts).to.have.lengthOf(1);",
+                  "  pm.expect(accounts[0].accountId).to.eql(pm.collectionVariables.get('savingsId'));",
+                  "  pm.expect(accounts[0].position).to.eql(1);",
+                  "  pm.expect(accounts[0].main).to.eql(true);",
+                  "  pm.expect(accounts[0].status).to.eql('PENDING');",
+                  "});",
+                  "pm.collectionVariables.set('cardId', pm.response.json().id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/cards",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"customerId\": \"{{customerId}}\",\n  \"mainAccountId\": \"{{savingsId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "06 Esperar la tarjeta: ACTIVE",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "const tries = Number(pm.collectionVariables.get('pollCount') || 0);",
+                  "if (pm.response.code === 200 && body.status === 'PENDING_VERIFICATION' && tries < 60) {",
+                  "  // account-service aún no responde: se vuelve a consultar en un cuarto de segundo.",
+                  "  pm.collectionVariables.set('pollCount', tries + 1);",
+                  "  setTimeout(() => {}, 250);",
+                  "  pm.execution.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.unset('pollCount');",
+                  "  pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "  pm.test('ACTIVE: account-service confirmó que la cuenta es del cliente', () => {",
+                  "    pm.expect(body.status).to.eql('ACTIVE');",
+                  "    pm.expect(body.accounts[0].status).to.eql('LINKED');",
+                  "    pm.expect(body.accounts[0].currency).to.eql('PEN');",
+                  "    pm.expect(body.mainAccountId).to.eql(pm.collectionVariables.get('savingsId'));",
+                  "    pm.expect(body).to.not.have.any.keys('rejection');",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/cards/{{cardId}}"
+          }
+        },
+        {
+          "name": "07 Tarjetas del cliente",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('El cliente tiene una tarjeta', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.totalElements).to.eql(1);",
+                  "  pm.expect(body.items[0].id).to.eql(pm.collectionVariables.get('cardId'));",
+                  "  pm.expect(body.items[0].maskedNumber).to.match(/^\\*{4} \\*{4} \\*{4} \\d{4}$/);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/cards?customerId={{customerId}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. Segunda cuenta asociada a la tarjeta",
+      "item": [
+        {
+          "name": "08 Asociar la cuenta corriente",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.unset('pollCount');"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('202 Accepted: la cuenta espera su verificación en la posición 2', () => {",
+                  "  pm.response.to.have.status(202);",
+                  "  const body = pm.response.json();",
+                  "  const linked = body.accounts.find(account => account.accountId === pm.collectionVariables.get('checkingId'));",
+                  "  pm.expect(linked.status).to.eql('PENDING');",
+                  "  pm.expect(linked.position).to.eql(2);",
+                  "  pm.expect(linked.main).to.eql(false);",
+                  "  pm.expect(body.status).to.eql('ACTIVE');",
+                  "  pm.expect(body.mainAccountId).to.eql(pm.collectionVariables.get('savingsId'));",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/cards/{{cardId}}/accounts",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"accountId\": \"{{checkingId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "09 Esperar la asociación: LINKED",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "const tries = Number(pm.collectionVariables.get('pollCount') || 0);",
+                  "if (pm.response.code === 200 && body.accounts.some(account => account.status === 'PENDING') && tries < 60) {",
+                  "  // account-service aún no responde: se vuelve a consultar en un cuarto de segundo.",
+                  "  pm.collectionVariables.set('pollCount', tries + 1);",
+                  "  setTimeout(() => {}, 250);",
+                  "  pm.execution.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.unset('pollCount');",
+                  "  pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "  pm.test('Las dos cuentas quedan LINKED en el orden en que se asociaron', () => {",
+                  "    pm.expect(body.accounts.map(account => account.accountId)).to.eql([",
+                  "      pm.collectionVariables.get('savingsId'), pm.collectionVariables.get('checkingId')]);",
+                  "    pm.expect(body.accounts.map(account => account.status)).to.eql(['LINKED', 'LINKED']);",
+                  "    pm.expect(body.accounts.map(account => account.main)).to.eql([true, false]);",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/cards/{{cardId}}"
+          }
+        },
+        {
+          "name": "10 Asociar otra vez la misma cuenta (409)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('409 ACCOUNT_ALREADY_LINKED', () => {",
+                  "  pm.response.to.have.status(409);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.code).to.eql('ACCOUNT_ALREADY_LINKED');",
+                  "  pm.expect(body.message).to.be.a('string').and.not.empty;",
+                  "  pm.expect(body.traceId).to.be.a('string').and.not.empty;",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/cards/{{cardId}}/accounts",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"accountId\": \"{{checkingId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "11 Quitar la cuenta principal (422)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('422 MAIN_ACCOUNT_REQUIRED', () => {",
+                  "  pm.response.to.have.status(422);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.code).to.eql('MAIN_ACCOUNT_REQUIRED');",
+                  "  pm.expect(body.message).to.be.a('string').and.not.empty;",
+                  "  pm.expect(body.traceId).to.be.a('string').and.not.empty;",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/cards/{{cardId}}/accounts/{{savingsId}}"
+          }
+        },
+        {
+          "name": "12 Elegir como principal una cuenta que no está asociada (422)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('422 ACCOUNT_NOT_LINKED', () => {",
+                  "  pm.response.to.have.status(422);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.code).to.eql('ACCOUNT_NOT_LINKED');",
+                  "  pm.expect(body.message).to.be.a('string').and.not.empty;",
+                  "  pm.expect(body.traceId).to.be.a('string').and.not.empty;",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/cards/{{cardId}}/main-account",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"accountId\": \"{{$guid}}\"\n}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "4. Pago con cargo a la cuenta principal (transaction-service)",
+      "item": [
+        {
+          "name": "13 Pagar 100 con la tarjeta",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set('operationId', pm.variables.replaceIn('{{$guid}}'));",
+                  "pm.collectionVariables.unset('pollCount');"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('202 Accepted: el pago queda registrado y en curso', () => {",
+                  "  pm.response.to.have.status(202);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.id).to.eql(pm.collectionVariables.get('operationId'));",
+                  "  pm.expect(body.type).to.eql('CARD_PAYMENT');",
+                  "  pm.expect(body.sourceCardId).to.eql(pm.collectionVariables.get('cardId'));",
+                  "  pm.expect(body.amount).to.eql(100);",
+                  "  pm.expect(pm.response.headers.get('Location')).to.eql('/api/v1/transactions/' + body.id);",
+                  "});",
+                  "// La cuenta de ahorro tiene 300: el cargo sale de ella."
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/transactions/card-payments",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"operationId\": \"{{operationId}}\",\n  \"cardId\": \"{{cardId}}\",\n  \"amount\": 100,\n  \"currency\": \"PEN\",\n  \"description\": \"Supermercado\"\n}"
+            }
+          }
+        },
+        {
+          "name": "14 Esperar el resultado: COMPLETED en la cuenta de ahorro",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "const tries = Number(pm.collectionVariables.get('pollCount') || 0);",
+                  "if (pm.response.code === 200 && body.status.startsWith('PENDING_') && tries < 60) {",
+                  "  // El pago sigue en curso: se vuelve a consultar en un cuarto de segundo.",
+                  "  pm.collectionVariables.set('pollCount', tries + 1);",
+                  "  setTimeout(() => {}, 250);",
+                  "  pm.execution.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.unset('pollCount');",
+                  "  pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "  pm.test('COMPLETED con cargo a la cuenta principal, saldo 200', () => {",
+                  "    pm.expect(body.status).to.eql('COMPLETED');",
+                  "    pm.expect(body.accountId).to.eql(pm.collectionVariables.get('savingsId'));",
+                  "    pm.expect(body.fee).to.eql(0);",
+                  "    pm.expect(body.accountBalanceAfter).to.eql(200);",
+                  "    pm.expect(body).to.not.have.any.keys('rejection');",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/transactions/{{operationId}}"
+          }
+        },
+        {
+          "name": "15 Saldo de la cuenta de ahorro: 200",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('Saldo 200', () => pm.expect(pm.response.json().balance).to.eql(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/accounts/{{savingsId}}/balance"
+          }
+        },
+        {
+          "name": "16 Saldo de la cuenta corriente: 1000",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('Saldo 1000', () => pm.expect(pm.response.json().balance).to.eql(1000));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/accounts/{{checkingId}}/balance"
+          }
+        }
+      ]
+    },
+    {
+      "name": "5. Pago que pasa a la segunda cuenta por falta de saldo",
+      "item": [
+        {
+          "name": "17 Pagar 250 con 200 en la cuenta principal",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set('operationId', pm.variables.replaceIn('{{$guid}}'));",
+                  "pm.collectionVariables.unset('pollCount');"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('202 Accepted: el pago queda registrado y en curso', () => {",
+                  "  pm.response.to.have.status(202);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.id).to.eql(pm.collectionVariables.get('operationId'));",
+                  "  pm.expect(body.type).to.eql('CARD_PAYMENT');",
+                  "  pm.expect(body.sourceCardId).to.eql(pm.collectionVariables.get('cardId'));",
+                  "  pm.expect(body.amount).to.eql(250);",
+                  "  pm.expect(pm.response.headers.get('Location')).to.eql('/api/v1/transactions/' + body.id);",
+                  "});",
+                  "// La cuenta de ahorro no alcanza: se intenta la cuenta corriente, que sigue en el orden."
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/transactions/card-payments",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"operationId\": \"{{operationId}}\",\n  \"cardId\": \"{{cardId}}\",\n  \"amount\": 250,\n  \"currency\": \"PEN\",\n  \"description\": \"Farmacia\"\n}"
+            }
+          }
+        },
+        {
+          "name": "18 Esperar el resultado: COMPLETED en la cuenta corriente",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "const tries = Number(pm.collectionVariables.get('pollCount') || 0);",
+                  "if (pm.response.code === 200 && body.status.startsWith('PENDING_') && tries < 60) {",
+                  "  // El pago sigue en curso: se vuelve a consultar en un cuarto de segundo.",
+                  "  pm.collectionVariables.set('pollCount', tries + 1);",
+                  "  setTimeout(() => {}, 250);",
+                  "  pm.execution.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.unset('pollCount');",
+                  "  pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "  pm.test('COMPLETED con cargo a la segunda cuenta, saldo 750', () => {",
+                  "    pm.expect(body.status).to.eql('COMPLETED');",
+                  "    pm.expect(body.accountId).to.eql(pm.collectionVariables.get('checkingId'));",
+                  "    pm.expect(body.accountBalanceAfter).to.eql(750);",
+                  "    pm.expect(body).to.not.have.any.keys('rejection');",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/transactions/{{operationId}}"
+          }
+        },
+        {
+          "name": "19 La cuenta de ahorro sigue en 200",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('Saldo 200', () => pm.expect(pm.response.json().balance).to.eql(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/accounts/{{savingsId}}/balance"
+          }
+        },
+        {
+          "name": "20 Saldo de la cuenta corriente: 750",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('Saldo 750', () => pm.expect(pm.response.json().balance).to.eql(750));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/accounts/{{checkingId}}/balance"
+          }
+        }
+      ]
+    },
+    {
+      "name": "6. Pago rechazado: ninguna cuenta tiene saldo",
+      "item": [
+        {
+          "name": "21 Pagar 5000 con la tarjeta",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set('operationId', pm.variables.replaceIn('{{$guid}}'));",
+                  "pm.collectionVariables.unset('pollCount');"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('202 Accepted: el pago queda registrado y en curso', () => {",
+                  "  pm.response.to.have.status(202);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.id).to.eql(pm.collectionVariables.get('operationId'));",
+                  "  pm.expect(body.type).to.eql('CARD_PAYMENT');",
+                  "  pm.expect(body.sourceCardId).to.eql(pm.collectionVariables.get('cardId'));",
+                  "  pm.expect(body.amount).to.eql(5000);",
+                  "  pm.expect(pm.response.headers.get('Location')).to.eql('/api/v1/transactions/' + body.id);",
+                  "});",
+                  "// Ni la cuenta de ahorro (200) ni la corriente (750) alcanzan."
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/transactions/card-payments",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"operationId\": \"{{operationId}}\",\n  \"cardId\": \"{{cardId}}\",\n  \"amount\": 5000,\n  \"currency\": \"PEN\",\n  \"description\": \"Electrodomésticos\"\n}"
+            }
+          }
+        },
+        {
+          "name": "22 Esperar el resultado: REJECTED por INSUFFICIENT_FUNDS",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "const tries = Number(pm.collectionVariables.get('pollCount') || 0);",
+                  "if (pm.response.code === 200 && body.status.startsWith('PENDING_') && tries < 60) {",
+                  "  // El pago sigue en curso: se vuelve a consultar en un cuarto de segundo.",
+                  "  pm.collectionVariables.set('pollCount', tries + 1);",
+                  "  setTimeout(() => {}, 250);",
+                  "  pm.execution.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.unset('pollCount');",
+                  "  pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "  pm.test('REJECTED: las dos cuentas rechazaron el cargo por INSUFFICIENT_FUNDS', () => {",
+                  "    pm.expect(body.status).to.eql('REJECTED');",
+                  "    pm.expect(body.rejection.step).to.eql('DEBIT');",
+                  "    pm.expect(body.rejection.code).to.eql('INSUFFICIENT_FUNDS');",
+                  "    pm.expect(body.rejection.message).to.be.a('string').and.not.empty;",
+                  "    pm.expect(body).to.not.have.any.keys('fee', 'accountBalanceAfter');",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/transactions/{{operationId}}"
+          }
+        },
+        {
+          "name": "23 La cuenta de ahorro sigue en 200",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('Saldo 200', () => pm.expect(pm.response.json().balance).to.eql(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/accounts/{{savingsId}}/balance"
+          }
+        },
+        {
+          "name": "24 La cuenta corriente sigue en 750",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('Saldo 750', () => pm.expect(pm.response.json().balance).to.eql(750));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/accounts/{{checkingId}}/balance"
+          }
+        }
+      ]
+    },
+    {
+      "name": "7. Últimos diez movimientos de la tarjeta",
+      "item": [
+        {
+          "name": "25 Reporte de los últimos movimientos",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('Dos movimientos, del más reciente al más antiguo; el pago rechazado no aparece', () => {",
+                  "  pm.expect(body.cardId).to.eql(pm.collectionVariables.get('cardId'));",
+                  "  pm.expect(body.items.map(item => item.amount)).to.eql([250, 100]);",
+                  "  pm.expect(body.items.map(item => item.description)).to.eql(['Farmacia', 'Supermercado']);",
+                  "});",
+                  "pm.test('Cada movimiento dice de qué cuenta salió el dinero', () => {",
+                  "  pm.expect(body.items.map(item => item.accountId)).to.eql([",
+                  "    pm.collectionVariables.get('checkingId'), pm.collectionVariables.get('savingsId')]);",
+                  "  body.items.forEach(item => {",
+                  "    pm.expect(item.type).to.eql('CARD_PAYMENT');",
+                  "    pm.expect(item.direction).to.eql('DEBIT');",
+                  "    pm.expect(item.fee).to.eql(0);",
+                  "    pm.expect(item.currency).to.eql('PEN');",
+                  "    pm.expect(item.occurredAt).to.be.a('string').and.not.empty;",
+                  "  });",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/transactions/cards/{{cardId}}/movements/latest"
+          }
+        }
+      ]
+    },
+    {
+      "name": "8. Cambio de cuenta principal",
+      "item": [
+        {
+          "name": "26 La cuenta corriente pasa a ser la principal",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('La principal es la corriente y las cuentas conservan su orden', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.mainAccountId).to.eql(pm.collectionVariables.get('checkingId'));",
+                  "  pm.expect(body.accounts.map(account => account.accountId)).to.eql([",
+                  "    pm.collectionVariables.get('savingsId'), pm.collectionVariables.get('checkingId')]);",
+                  "  pm.expect(body.accounts.map(account => account.main)).to.eql([false, true]);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/cards/{{cardId}}/main-account",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"accountId\": \"{{checkingId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "27 Pagar 50: el cargo va a la nueva cuenta principal",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set('operationId', pm.variables.replaceIn('{{$guid}}'));",
+                  "pm.collectionVariables.unset('pollCount');"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('202 Accepted: el pago queda registrado y en curso', () => {",
+                  "  pm.response.to.have.status(202);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.id).to.eql(pm.collectionVariables.get('operationId'));",
+                  "  pm.expect(body.type).to.eql('CARD_PAYMENT');",
+                  "  pm.expect(body.sourceCardId).to.eql(pm.collectionVariables.get('cardId'));",
+                  "  pm.expect(body.amount).to.eql(50);",
+                  "  pm.expect(pm.response.headers.get('Location')).to.eql('/api/v1/transactions/' + body.id);",
+                  "});",
+                  "// La cuenta de ahorro tiene 200 y alcanzaría, pero ya no es la principal."
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/transactions/card-payments",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"operationId\": \"{{operationId}}\",\n  \"cardId\": \"{{cardId}}\",\n  \"amount\": 50,\n  \"currency\": \"PEN\",\n  \"description\": \"Taxi\"\n}"
+            }
+          }
+        },
+        {
+          "name": "28 Esperar el resultado: COMPLETED en la cuenta corriente",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "const tries = Number(pm.collectionVariables.get('pollCount') || 0);",
+                  "if (pm.response.code === 200 && body.status.startsWith('PENDING_') && tries < 60) {",
+                  "  // El pago sigue en curso: se vuelve a consultar en un cuarto de segundo.",
+                  "  pm.collectionVariables.set('pollCount', tries + 1);",
+                  "  setTimeout(() => {}, 250);",
+                  "  pm.execution.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.unset('pollCount');",
+                  "  pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "  pm.test('COMPLETED con cargo a la cuenta corriente, saldo 700', () => {",
+                  "    pm.expect(body.status).to.eql('COMPLETED');",
+                  "    pm.expect(body.accountId).to.eql(pm.collectionVariables.get('checkingId'));",
+                  "    pm.expect(body.accountBalanceAfter).to.eql(700);",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/transactions/{{operationId}}"
+          }
+        },
+        {
+          "name": "29 La cuenta de ahorro sigue en 200",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('Saldo 200', () => pm.expect(pm.response.json().balance).to.eql(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/accounts/{{savingsId}}/balance"
+          }
+        }
+      ]
+    },
+    {
+      "name": "9. Tarjeta bloqueada",
+      "item": [
+        {
+          "name": "30 Bloquear la tarjeta",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('BLOCKED', () => pm.expect(pm.response.json().status).to.eql('BLOCKED'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/cards/{{cardId}}/block"
+          }
+        },
+        {
+          "name": "31 Pagar 10 con la tarjeta bloqueada",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set('operationId', pm.variables.replaceIn('{{$guid}}'));",
+                  "pm.collectionVariables.unset('pollCount');"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('202 Accepted: el pago queda registrado y en curso', () => {",
+                  "  pm.response.to.have.status(202);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.id).to.eql(pm.collectionVariables.get('operationId'));",
+                  "  pm.expect(body.type).to.eql('CARD_PAYMENT');",
+                  "  pm.expect(body.sourceCardId).to.eql(pm.collectionVariables.get('cardId'));",
+                  "  pm.expect(body.amount).to.eql(10);",
+                  "  pm.expect(pm.response.headers.get('Location')).to.eql('/api/v1/transactions/' + body.id);",
+                  "});",
+                  "// transaction-service registra el pago; card-service lo rechaza al consultar la tarjeta."
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/transactions/card-payments",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"operationId\": \"{{operationId}}\",\n  \"cardId\": \"{{cardId}}\",\n  \"amount\": 10,\n  \"currency\": \"PEN\",\n  \"description\": \"Café\"\n}"
+            }
+          }
+        },
+        {
+          "name": "32 Esperar el resultado: REJECTED por CARD_NOT_ACTIVE",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "const tries = Number(pm.collectionVariables.get('pollCount') || 0);",
+                  "if (pm.response.code === 200 && body.status.startsWith('PENDING_') && tries < 60) {",
+                  "  // El pago sigue en curso: se vuelve a consultar en un cuarto de segundo.",
+                  "  pm.collectionVariables.set('pollCount', tries + 1);",
+                  "  setTimeout(() => {}, 250);",
+                  "  pm.execution.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.unset('pollCount');",
+                  "  pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "  pm.test('REJECTED por la tarjeta: CARD_NOT_ACTIVE', () => {",
+                  "    pm.expect(body.status).to.eql('REJECTED');",
+                  "    pm.expect(body.rejection.step).to.eql('CARD');",
+                  "    pm.expect(body.rejection.code).to.eql('CARD_NOT_ACTIVE');",
+                  "    pm.expect(body).to.not.have.any.keys('fee', 'accountBalanceAfter');",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/transactions/{{operationId}}"
+          }
+        },
+        {
+          "name": "33 La cuenta corriente sigue en 700",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('Saldo 700', () => pm.expect(pm.response.json().balance).to.eql(700));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/accounts/{{checkingId}}/balance"
+          }
+        },
+        {
+          "name": "34 Asociar una cuenta a la tarjeta bloqueada (422)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('422 CARD_NOT_ACTIVE', () => {",
+                  "  pm.response.to.have.status(422);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.code).to.eql('CARD_NOT_ACTIVE');",
+                  "  pm.expect(body.message).to.be.a('string').and.not.empty;",
+                  "  pm.expect(body.traceId).to.be.a('string').and.not.empty;",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/cards/{{cardId}}/accounts",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"accountId\": \"{{$guid}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "35 Desbloquear la tarjeta",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('ACTIVE', () => pm.expect(pm.response.json().status).to.eql('ACTIVE'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/cards/{{cardId}}/unblock"
+          }
+        }
+      ]
+    },
+    {
+      "name": "10. Tarjeta sobre la cuenta de otro cliente",
+      "item": [
+        {
+          "name": "36 Crear otro cliente",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Documento nuevo en cada corrida: customer-service no admite documentos repetidos.",
+                  "pm.collectionVariables.set('otherDocument', String(Math.floor(10000000 + Math.random() * 90000000)));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "pm.test('Cliente PERSONAL STANDARD ACTIVE', () => {",
+                  "  pm.expect(body.type).to.eql('PERSONAL');",
+                  "  pm.expect(body.profile).to.eql('STANDARD');",
+                  "  pm.expect(body.status).to.eql('ACTIVE');",
+                  "});",
+                  "pm.collectionVariables.set('otherCustomerId', body.id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/customers",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"type\": \"PERSONAL\",\n  \"profile\": \"STANDARD\",\n  \"documentType\": \"DNI\",\n  \"documentNumber\": \"{{otherDocument}}\",\n  \"name\": \"Bruno Diaz\"\n}"
+            }
+          }
+        },
+        {
+          "name": "37 Pedir una tarjeta para el otro cliente con la cuenta del primero",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.unset('pollCount');"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('202 Accepted: card-service no decide, pregunta a account-service', () => {",
+                  "  pm.response.to.have.status(202);",
+                  "  pm.expect(pm.response.json().status).to.eql('PENDING_VERIFICATION');",
+                  "});",
+                  "pm.collectionVariables.set('rejectedCardId', pm.response.json().id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/cards",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"customerId\": \"{{otherCustomerId}}\",\n  \"mainAccountId\": \"{{savingsId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "38 Esperar la tarjeta: REJECTED",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "const tries = Number(pm.collectionVariables.get('pollCount') || 0);",
+                  "if (pm.response.code === 200 && body.status === 'PENDING_VERIFICATION' && tries < 60) {",
+                  "  // account-service aún no responde: se vuelve a consultar en un cuarto de segundo.",
+                  "  pm.collectionVariables.set('pollCount', tries + 1);",
+                  "  setTimeout(() => {}, 250);",
+                  "  pm.execution.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.unset('pollCount');",
+                  "  pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "  pm.test('REJECTED: el cliente no es titular de la cuenta', () => {",
+                  "    pm.expect(body.status).to.eql('REJECTED');",
+                  "    pm.expect(body.rejection.code).to.eql('ACCOUNT_NOT_OWNED');",
+                  "    pm.expect(body.rejection.message).to.be.a('string').and.not.empty;",
+                  "    pm.expect(body.accounts[0].status).to.eql('REJECTED');",
+                  "    pm.expect(body.accounts[0].rejection.code).to.eql('ACCOUNT_NOT_OWNED');",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/cards/{{rejectedCardId}}"
+          }
+        },
+        {
+          "name": "39 La tarjeta rechazada no admite cuentas (422)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('422 CARD_NOT_ACTIVE', () => {",
+                  "  pm.response.to.have.status(422);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.code).to.eql('CARD_NOT_ACTIVE');",
+                  "  pm.expect(body.message).to.be.a('string').and.not.empty;",
+                  "  pm.expect(body.traceId).to.be.a('string').and.not.empty;",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/cards/{{rejectedCardId}}/accounts",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"accountId\": \"{{checkingId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "40 El primer cliente sigue con una sola tarjeta",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('Una tarjeta, ACTIVE', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.totalElements).to.eql(1);",
+                  "  pm.expect(body.items[0].status).to.eql('ACTIVE');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/cards?customerId={{customerId}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "11. Validación y consultas",
+      "item": [
+        {
+          "name": "41 Tarjeta que no existe (404)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('404 CARD_NOT_FOUND', () => {",
+                  "  pm.response.to.have.status(404);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.code).to.eql('CARD_NOT_FOUND');",
+                  "  pm.expect(body.message).to.be.a('string').and.not.empty;",
+                  "  pm.expect(body.traceId).to.be.a('string').and.not.empty;",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/cards/{{$guid}}"
+          }
+        },
+        {
+          "name": "42 Pedir una tarjeta sin cuenta principal (400)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400 INVALID_REQUEST', () => {",
+                  "  pm.response.to.have.status(400);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.code).to.eql('INVALID_REQUEST');",
+                  "  pm.expect(body.message).to.be.a('string').and.not.empty;",
+                  "  pm.expect(body.traceId).to.be.a('string').and.not.empty;",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/cards",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"customerId\": \"{{customerId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "43 Campo que no es del contrato (400)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400 INVALID_REQUEST', () => {",
+                  "  pm.response.to.have.status(400);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.code).to.eql('INVALID_REQUEST');",
+                  "  pm.expect(body.message).to.be.a('string').and.not.empty;",
+                  "  pm.expect(body.traceId).to.be.a('string').and.not.empty;",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/cards",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"customerId\": \"{{customerId}}\",\n  \"mainAccountId\": \"{{savingsId}}\",\n  \"status\": \"ACTIVE\"\n}"
+            }
+          }
+        },
+        {
+          "name": "44 Quitar una cuenta que la tarjeta no tiene (404)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('404 ACCOUNT_NOT_LINKED', () => {",
+                  "  pm.response.to.have.status(404);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.code).to.eql('ACCOUNT_NOT_LINKED');",
+                  "  pm.expect(body.message).to.be.a('string').and.not.empty;",
+                  "  pm.expect(body.traceId).to.be.a('string').and.not.empty;",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/cards/{{cardId}}/accounts/{{$guid}}"
+          }
+        },
+        {
+          "name": "45 Tamaño de página fuera de rango (400)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400 INVALID_REQUEST', () => {",
+                  "  pm.response.to.have.status(400);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.code).to.eql('INVALID_REQUEST');",
+                  "  pm.expect(body.message).to.be.a('string').and.not.empty;",
+                  "  pm.expect(body.traceId).to.be.a('string').and.not.empty;",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/cards?size=101"
+          }
+        }
+      ]
+    },
+    {
+      "name": "12. Límite de tres tarjetas por cliente",
+      "item": [
+        {
+          "name": "46 Pedir la segunda tarjeta del cliente",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('202 Accepted: la tarjeta espera la verificación de su cuenta', () => {",
+                  "  pm.response.to.have.status(202);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.status).to.eql('PENDING_VERIFICATION');",
+                  "  pm.expect(body.customerId).to.eql(pm.collectionVariables.get('customerId'));",
+                  "  pm.expect(body.id).to.not.eql(pm.collectionVariables.get('cardId'));",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/cards",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"customerId\": \"{{customerId}}\",\n  \"mainAccountId\": \"{{checkingId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "47 Pedir la tercera tarjeta del cliente",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('202 Accepted: la tarjeta espera la verificación de su cuenta', () => {",
+                  "  pm.response.to.have.status(202);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.status).to.eql('PENDING_VERIFICATION');",
+                  "  pm.expect(body.customerId).to.eql(pm.collectionVariables.get('customerId'));",
+                  "  pm.expect(body.id).to.not.eql(pm.collectionVariables.get('cardId'));",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/cards",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"customerId\": \"{{customerId}}\",\n  \"mainAccountId\": \"{{savingsId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "48 Pedir la cuarta tarjeta (422)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('422 CARD_LIMIT_REACHED: el cliente ya tiene tres tarjetas', () => {",
+                  "  pm.response.to.have.status(422);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.code).to.eql('CARD_LIMIT_REACHED');",
+                  "  pm.expect(body.message).to.be.a('string').and.not.empty;",
+                  "  pm.expect(body.path).to.eql('/api/v1/cards');",
+                  "  pm.expect(body.traceId).to.be.a('string').and.not.empty;",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/cards",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"customerId\": \"{{customerId}}\",\n  \"mainAccountId\": \"{{checkingId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "49 El cliente sigue con tres tarjetas",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('Tres tarjetas y ninguna REJECTED: la cuarta no se registró', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.totalElements).to.eql(3);",
+                  "  pm.expect(body.items).to.have.lengthOf(3);",
+                  "  body.items.forEach(card => pm.expect(card.status).to.not.eql('REJECTED'));",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/cards?customerId={{customerId}}"
+          }
+        },
+        {
+          "name": "50 La tarjeta rechazada del otro cliente no cuenta para su límite",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('El otro cliente solo tiene la tarjeta REJECTED de la carpeta 10', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.totalElements).to.eql(1);",
+                  "  pm.expect(body.items[0].id).to.eql(pm.collectionVariables.get('rejectedCardId'));",
+                  "  pm.expect(body.items[0].status).to.eql('REJECTED');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/cards?customerId={{otherCustomerId}}"
+          }
+        }
+      ]
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8080"
+    },
+    {
+      "key": "username",
+      "value": "admin"
+    },
+    {
+      "key": "password",
+      "value": "Admin-dev-2026"
+    },
+    {
+      "key": "accessToken",
+      "value": ""
+    },
+    {
+      "key": "accessTokenExpiresAt",
+      "value": "0"
+    },
+    {
+      "key": "document",
+      "value": ""
+    },
+    {
+      "key": "otherDocument",
+      "value": ""
+    },
+    {
+      "key": "customerId",
+      "value": ""
+    },
+    {
+      "key": "otherCustomerId",
+      "value": ""
+    },
+    {
+      "key": "savingsId",
+      "value": ""
+    },
+    {
+      "key": "checkingId",
+      "value": ""
+    },
+    {
+      "key": "cardId",
+      "value": ""
+    },
+    {
+      "key": "rejectedCardId",
+      "value": ""
+    },
+    {
+      "key": "operationId",
+      "value": ""
+    },
+    {
+      "key": "pollCount",
+      "value": ""
+    }
+  ]
+}
