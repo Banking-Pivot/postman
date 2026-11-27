@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "auth-service - inicio de sesión, roles y tokens",
-    "description": "Seguridad de la plataforma vista desde fuera: inicio de sesión, peticiones sin token, lo que puede hacer un ADMIN y lo que no puede hacer un USER, usuarios deshabilitados, bloqueo por contraseñas incorrectas, tokens de servicio y la clave pública (JWKS). Todo va por el API Gateway (perfil dev, puerto 8080), que necesita discovery-server, auth-service y product-service arriba; ajusta baseUrl si corre en otra dirección. La colección inicia sesión sola con username y password (el primer administrador; su contraseña de desarrollo está en Vault) y manda el token en todas las peticiones, salvo en las que prueban justamente que falta. Corre la colección completa y en orden: cada carpeta usa lo que crean las anteriores. Cada corrida crea tres usuarios nuevos y los deja deshabilitados: usuario.NNNNNN, bloqueo.NNNNNN y clave.NNNNNN, con el que se prueba la contraseña incorrecta. Ninguna petición falla el inicio de sesión del administrador: cinco contraseñas incorrectas seguidas bloquean a un usuario durante 15 minutos, y también a él.",
+    "description": "Seguridad de la plataforma vista desde fuera: inicio de sesión, peticiones sin token, lo que puede hacer un ADMIN y lo que no puede hacer un USER, usuarios deshabilitados, bloqueo por contraseñas incorrectas, tokens de servicio, la clave pública (JWKS) y la actualización y eliminación de usuarios. Todo va por el API Gateway (perfil dev, puerto 8080), que necesita discovery-server, auth-service y product-service arriba; ajusta baseUrl si corre en otra dirección. La colección inicia sesión sola con username y password (el primer administrador; su contraseña de desarrollo está en Vault) y manda el token en todas las peticiones, salvo en las que prueban justamente que falta. Corre la colección completa y en orden: cada carpeta usa lo que crean las anteriores. Cada corrida crea tres usuarios nuevos y los deja deshabilitados: usuario.NNNNNN, bloqueo.NNNNNN y clave.NNNNNN, con el que se prueba la contraseña incorrecta. La última carpeta crea un cuarto usuario, crud.NNNNNN, y lo elimina. Ninguna petición falla el inicio de sesión del administrador: cinco contraseñas incorrectas seguidas bloquean a un usuario durante 15 minutos, y también a él.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "auth": {
@@ -1538,6 +1538,401 @@
           }
         }
       ]
+    },
+    {
+      "name": "8. Actualizar y eliminar usuarios",
+      "description": "El administrador reemplaza los roles de un usuario con PUT /api/v1/auth/users/{userId} y, si el pedido trae password, también su contraseña: la contraseña nueva borra los intentos fallidos y el bloqueo. DELETE /api/v1/auth/users/{userId} elimina al usuario y responde 204. El administrador inicial (el que el servicio crea al arrancar, el mismo con el que la colección inicia sesión) no se puede eliminar ni puede perder el rol ADMIN: ambos intentos responden 409 INITIAL_ADMIN_PROTECTED y lo dejan como estaba. La carpeta usa un usuario propio (crud.NNNNNN) y lo elimina al terminar.",
+      "item": [
+        {
+          "name": "42 El administrador crea un usuario para actualizarlo y eliminarlo",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Usuario propio de esta carpeta: al final se elimina.",
+                  "pm.collectionVariables.set('crudUsername',",
+                  "  'crud.' + Math.floor(100000 + Math.random() * 900000));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('201 Created con rol USER', () => {",
+                  "  pm.response.to.have.status(201);",
+                  "  pm.expect(body.roles).to.eql(['USER']);",
+                  "});",
+                  "pm.collectionVariables.set('crudUserId', body.id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/auth/users",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"{{crudUsername}}\",\n  \"password\": \"{{newPassword}}\",\n  \"roles\": [\"USER\"]\n}"
+            }
+          }
+        },
+        {
+          "name": "43 Actualizar sus roles a ADMIN y USER",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('200 OK con los roles nuevos', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(body.id).to.eql(pm.collectionVariables.get('crudUserId'));",
+                  "  pm.expect(body.roles).to.eql(['ADMIN', 'USER']);",
+                  "});",
+                  "pm.test('El nombre y el estado no cambian', () => {",
+                  "  pm.expect(body.username).to.eql(pm.collectionVariables.get('crudUsername'));",
+                  "  pm.expect(body.status).to.eql('ACTIVE');",
+                  "});",
+                  "pm.test('La respuesta no trae la contraseña', () =>",
+                  "  pm.expect(body).to.not.have.property('password'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/auth/users/{{crudUserId}}",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"roles\": [\"ADMIN\", \"USER\"]\n}"
+            }
+          }
+        },
+        {
+          "name": "44 Actualizar su contraseña y dejarlo con rol USER",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('200 OK con rol USER, sin intentos fallidos y sin bloqueo', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(body.roles).to.eql(['USER']);",
+                  "  pm.expect(body.failedAttempts).to.eql(0);",
+                  "  pm.expect(body).to.not.have.property('lockedUntil');",
+                  "});",
+                  "pm.test('La respuesta no trae la contraseña', () =>",
+                  "  pm.expect(body).to.not.have.property('password'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/auth/users/{{crudUserId}}",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"roles\": [\"USER\"],\n  \"password\": \"Clave-cambiada-2026\"\n}"
+            }
+          }
+        },
+        {
+          "name": "45 El usuario inicia sesión con la contraseña nueva",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('200 OK con un token de rol USER', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(body.accessToken).to.be.a('string').and.not.empty;",
+                  "  pm.expect(body.roles).to.eql(['USER']);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/auth/login",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"{{crudUsername}}\",\n  \"password\": \"Clave-cambiada-2026\"\n}"
+            }
+          }
+        },
+        {
+          "name": "46 Actualizar con un cuerpo inválido, sin roles (400)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400 Bad Request con código INVALID_REQUEST', () => {",
+                  "  pm.response.to.have.status(400);",
+                  "  pm.expect(pm.response.json().code).to.eql('INVALID_REQUEST');",
+                  "});",
+                  "pm.test('El mensaje nombra el campo inválido', () =>",
+                  "  pm.expect(pm.response.json().message).to.include('roles'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/auth/users/{{crudUserId}}",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"roles\": []\n}"
+            }
+          }
+        },
+        {
+          "name": "47 Actualizar a un usuario que no existe (404)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('404 Not Found con código USER_NOT_FOUND', () => {",
+                  "  pm.response.to.have.status(404);",
+                  "  pm.expect(pm.response.json().code).to.eql('USER_NOT_FOUND');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/auth/users/00000000-0000-4000-8000-000000000000",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"roles\": [\"USER\"]\n}"
+            }
+          }
+        },
+        {
+          "name": "48 El administrador busca al administrador inicial",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// El administrador inicial es el usuario con el que la colección inicia sesión.",
+                  "const username = pm.collectionVariables.get('username').toLowerCase();",
+                  "const admin = pm.response.json().items.find(user => user.username === username);",
+                  "pm.test('200 OK y el administrador inicial está en la lista con rol ADMIN', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(admin).to.be.an('object');",
+                  "  pm.expect(admin.roles).to.include('ADMIN');",
+                  "});",
+                  "pm.collectionVariables.set('adminUserId', admin.id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/auth/users?page=0&size=100"
+          }
+        },
+        {
+          "name": "49 Quitarle el rol ADMIN al administrador inicial (409)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('409 Conflict con código INITIAL_ADMIN_PROTECTED', () => {",
+                  "  pm.response.to.have.status(409);",
+                  "  pm.expect(pm.response.json().code).to.eql('INITIAL_ADMIN_PROTECTED');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/auth/users/{{adminUserId}}",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"roles\": [\"USER\"]\n}"
+            }
+          }
+        },
+        {
+          "name": "50 Eliminar al administrador inicial (409)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('409 Conflict con código INITIAL_ADMIN_PROTECTED', () => {",
+                  "  pm.response.to.have.status(409);",
+                  "  pm.expect(pm.response.json().code).to.eql('INITIAL_ADMIN_PROTECTED');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/auth/users/{{adminUserId}}"
+          }
+        },
+        {
+          "name": "51 El administrador inicial sigue igual",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('200 OK, activo y con rol ADMIN', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(body.status).to.eql('ACTIVE');",
+                  "  pm.expect(body.roles).to.include('ADMIN');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/auth/users/{{adminUserId}}"
+          }
+        },
+        {
+          "name": "52 Eliminar al usuario (204)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('204 No Content, sin cuerpo', () => {",
+                  "  pm.response.to.have.status(204);",
+                  "  pm.expect(pm.response.text()).to.eql('');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/auth/users/{{crudUserId}}"
+          }
+        },
+        {
+          "name": "53 Consultar al usuario eliminado (404)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('404 Not Found con código USER_NOT_FOUND', () => {",
+                  "  pm.response.to.have.status(404);",
+                  "  pm.expect(pm.response.json().code).to.eql('USER_NOT_FOUND');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/auth/users/{{crudUserId}}"
+          }
+        },
+        {
+          "name": "54 Eliminarlo otra vez (404)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('404 Not Found con código USER_NOT_FOUND', () => {",
+                  "  pm.response.to.have.status(404);",
+                  "  pm.expect(pm.response.json().code).to.eql('USER_NOT_FOUND');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/auth/users/{{crudUserId}}"
+          }
+        }
+      ]
     }
   ],
   "variable": [
@@ -1595,6 +1990,18 @@
     },
     {
       "key": "serviceClientSecret",
+      "value": ""
+    },
+    {
+      "key": "crudUsername",
+      "value": ""
+    },
+    {
+      "key": "crudUserId",
+      "value": ""
+    },
+    {
+      "key": "adminUserId",
       "value": ""
     }
   ]

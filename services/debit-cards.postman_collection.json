@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "card-service - tarjeta de débito",
-    "description": "Tarjeta de débito asociada a las cuentas bancarias de un cliente: emisión con número enmascarado, verificación de la cuenta con account-service por Kafka, segunda cuenta asociada, pago con cargo a la cuenta principal, pago que pasa a la siguiente cuenta cuando la principal no tiene saldo, pago rechazado, reporte de los últimos diez movimientos, cambio de cuenta principal, bloqueo, tarjeta rechazada por pedirla sobre la cuenta de otro cliente y límite de tres tarjetas por cliente (las rechazadas no cuentan). card-service guarda la tarjeta y sus cuentas; los pagos y el reporte de movimientos son de transaction-service. Todo va por el API Gateway (perfil dev, puerto 8080), que necesita Kafka, discovery-server, auth-service, customer-service, product-service, account-service, card-service y transaction-service arriba; ajusta baseUrl si corre en otra dirección. La colección inicia sesión sola con username y password. Corre la colección completa y en orden: cada carpeta usa el cliente, las cuentas y la tarjeta de las anteriores. Cada corrida crea clientes, cuentas, tarjetas y operationId nuevos, así que se puede repetir sobre la misma base.",
+    "description": "Tarjeta de débito asociada a las cuentas bancarias de un cliente: emisión con número enmascarado, verificación de la cuenta con account-service por Kafka, segunda cuenta asociada, pago con cargo a la cuenta principal, pago que pasa a la siguiente cuenta cuando la principal no tiene saldo, pago rechazado, reporte de los últimos diez movimientos, cambio de cuenta principal, bloqueo, tarjeta rechazada por pedirla sobre la cuenta de otro cliente límite de tres tarjetas por cliente (las rechazadas y las canceladas no cuentan) y cancelación de una tarjeta. card-service guarda la tarjeta y sus cuentas; los pagos y el reporte de movimientos son de transaction-service. Todo va por el API Gateway (perfil dev, puerto 8080), que necesita Kafka, discovery-server, auth-service, customer-service, product-service, account-service, card-service y transaction-service arriba; ajusta baseUrl si corre en otra dirección. La colección inicia sesión sola con username y password. Corre la colección completa y en orden: cada carpeta usa el cliente, las cuentas y la tarjeta de las anteriores. Cada corrida crea clientes, cuentas, tarjetas y operationId nuevos, así que se puede repetir sobre la misma base.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "auth": {
@@ -1744,6 +1744,395 @@
           }
         }
       ]
+    },
+    {
+      "name": "13. Cancelar una tarjeta",
+      "item": [
+        {
+          "name": "51 Elegir una de las tarjetas de la carpeta 12",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('El cliente tiene tres tarjetas: no puede pedir otra', () => {",
+                  "  pm.expect(pm.response.json().totalElements).to.eql(3);",
+                  "});",
+                  "// Se cancela una de las dos tarjetas de la carpeta 12, no la de las carpetas anteriores.",
+                  "const other = pm.response.json().items.find(card => card.id !== pm.collectionVariables.get('cardId'));",
+                  "pm.test('Hay una tarjeta distinta de la primera para cancelar', () => {",
+                  "  pm.expect(other).to.be.an('object');",
+                  "});",
+                  "pm.collectionVariables.set('freedCardId', other.id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/cards?customerId={{customerId}}"
+          }
+        },
+        {
+          "name": "52 Cancelar esa tarjeta: deja un lugar libre",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('204 No Content', () => pm.response.to.have.status(204));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/cards/{{freedCardId}}"
+          }
+        },
+        {
+          "name": "53 Pedir otra tarjeta: la cancelada ya no cuenta para el límite",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.unset('pollCount');"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('202 Accepted: la tarjeta espera la verificación de su cuenta', () => {",
+                  "  pm.response.to.have.status(202);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.status).to.eql('PENDING_VERIFICATION');",
+                  "  pm.expect(body.customerId).to.eql(pm.collectionVariables.get('customerId'));",
+                  "  pm.expect(body.mainAccountId).to.eql(pm.collectionVariables.get('savingsId'));",
+                  "  pm.expect(body.id).to.not.eql(pm.collectionVariables.get('freedCardId'));",
+                  "});",
+                  "pm.collectionVariables.set('cancelledCardId', pm.response.json().id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/cards",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"customerId\": \"{{customerId}}\",\n  \"mainAccountId\": \"{{savingsId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "54 Esperar la tarjeta nueva: ACTIVE",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "const tries = Number(pm.collectionVariables.get('pollCount') || 0);",
+                  "if (pm.response.code === 200 && body.status === 'PENDING_VERIFICATION' && tries < 60) {",
+                  "  // account-service aún no responde: se vuelve a consultar en un cuarto de segundo.",
+                  "  pm.collectionVariables.set('pollCount', tries + 1);",
+                  "  setTimeout(() => {}, 250);",
+                  "  pm.execution.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.unset('pollCount');",
+                  "  pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "  pm.test('ACTIVE: account-service confirmó que la cuenta es del cliente', () => {",
+                  "    pm.expect(body.status).to.eql('ACTIVE');",
+                  "    pm.expect(body.accounts[0].status).to.eql('LINKED');",
+                  "    pm.expect(body.mainAccountId).to.eql(pm.collectionVariables.get('savingsId'));",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/cards/{{cancelledCardId}}"
+          }
+        },
+        {
+          "name": "55 Cancelar la tarjeta",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('204 No Content', () => pm.response.to.have.status(204));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/cards/{{cancelledCardId}}"
+          }
+        },
+        {
+          "name": "56 Leer la tarjeta: CANCELLED",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('CANCELLED: la tarjeta se sigue leyendo, con su cuenta', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.id).to.eql(pm.collectionVariables.get('cancelledCardId'));",
+                  "  pm.expect(body.status).to.eql('CANCELLED');",
+                  "  pm.expect(body.mainAccountId).to.eql(pm.collectionVariables.get('savingsId'));",
+                  "  pm.expect(body.accounts).to.have.lengthOf(1);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/cards/{{cancelledCardId}}"
+          }
+        },
+        {
+          "name": "57 Bloquear la tarjeta cancelada (422)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('422 CARD_CANCELLED', () => {",
+                  "  pm.response.to.have.status(422);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.code).to.eql('CARD_CANCELLED');",
+                  "  pm.expect(body.message).to.be.a('string').and.not.empty;",
+                  "  pm.expect(body.traceId).to.be.a('string').and.not.empty;",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/cards/{{cancelledCardId}}/block"
+          }
+        },
+        {
+          "name": "58 Asociar una cuenta a la tarjeta cancelada (422)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('422 CARD_CANCELLED', () => {",
+                  "  pm.response.to.have.status(422);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.code).to.eql('CARD_CANCELLED');",
+                  "  pm.expect(body.message).to.be.a('string').and.not.empty;",
+                  "  pm.expect(body.traceId).to.be.a('string').and.not.empty;",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/cards/{{cancelledCardId}}/accounts",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"accountId\": \"{{checkingId}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "59 Cancelar otra vez la misma tarjeta (204)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('204 No Content: cancelar una tarjeta ya cancelada no cambia nada', () => {",
+                  "  pm.response.to.have.status(204);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/cards/{{cancelledCardId}}"
+          }
+        },
+        {
+          "name": "60 Pagar 10 con la tarjeta cancelada",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set('operationId', pm.variables.replaceIn('{{$guid}}'));",
+                  "pm.collectionVariables.unset('pollCount');"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('202 Accepted: el pago queda registrado y en curso', () => {",
+                  "  pm.response.to.have.status(202);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.id).to.eql(pm.collectionVariables.get('operationId'));",
+                  "  pm.expect(body.type).to.eql('CARD_PAYMENT');",
+                  "  pm.expect(body.sourceCardId).to.eql(pm.collectionVariables.get('cancelledCardId'));",
+                  "  pm.expect(body.amount).to.eql(10);",
+                  "});",
+                  "// transaction-service registra el pago; card-service lo rechaza al consultar la tarjeta."
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{baseUrl}}/api/v1/transactions/card-payments",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"operationId\": \"{{operationId}}\",\n  \"cardId\": \"{{cancelledCardId}}\",\n  \"amount\": 10,\n  \"currency\": \"PEN\",\n  \"description\": \"Café\"\n}"
+            }
+          }
+        },
+        {
+          "name": "61 Esperar el resultado: REJECTED por CARD_CANCELLED",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "const tries = Number(pm.collectionVariables.get('pollCount') || 0);",
+                  "if (pm.response.code === 200 && body.status.startsWith('PENDING_') && tries < 60) {",
+                  "  // El pago sigue en curso: se vuelve a consultar en un cuarto de segundo.",
+                  "  pm.collectionVariables.set('pollCount', tries + 1);",
+                  "  setTimeout(() => {}, 250);",
+                  "  pm.execution.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.unset('pollCount');",
+                  "  pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "  pm.test('REJECTED por la tarjeta: CARD_CANCELLED', () => {",
+                  "    pm.expect(body.status).to.eql('REJECTED');",
+                  "    pm.expect(body.rejection.step).to.eql('CARD');",
+                  "    pm.expect(body.rejection.code).to.eql('CARD_CANCELLED');",
+                  "    pm.expect(body).to.not.have.any.keys('fee', 'accountBalanceAfter');",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/transactions/{{operationId}}"
+          }
+        },
+        {
+          "name": "62 Cancelar una tarjeta que no existe (404)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('404 CARD_NOT_FOUND', () => {",
+                  "  pm.response.to.have.status(404);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.code).to.eql('CARD_NOT_FOUND');",
+                  "  pm.expect(body.message).to.be.a('string').and.not.empty;",
+                  "  pm.expect(body.traceId).to.be.a('string').and.not.empty;",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/cards/{{$guid}}"
+          }
+        },
+        {
+          "name": "63 Tarjetas del cliente: las canceladas siguen en la lista",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('Cuatro tarjetas, dos de ellas CANCELLED', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.totalElements).to.eql(4);",
+                  "  const cancelled = body.items.filter(card => card.status === 'CANCELLED').map(card => card.id);",
+                  "  pm.expect(cancelled).to.have.members([",
+                  "    pm.collectionVariables.get('freedCardId'),",
+                  "    pm.collectionVariables.get('cancelledCardId')]);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/api/v1/cards?customerId={{customerId}}"
+          }
+        }
+      ]
     }
   ],
   "variable": [
@@ -1805,6 +2194,14 @@
     },
     {
       "key": "pollCount",
+      "value": ""
+    },
+    {
+      "key": "freedCardId",
+      "value": ""
+    },
+    {
+      "key": "cancelledCardId",
       "value": ""
     }
   ]
